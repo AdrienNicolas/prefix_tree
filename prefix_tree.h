@@ -183,7 +183,9 @@ public:
     typedef std::pair<prefix_type, node_ptr> pair_type;
     typedef typename prefix_type::iterator key_inner_iterator;
     typedef initialized_array<pair_type, charset_type::size> node_container;
-	
+    typedef typename std::allocator_traits<allocator_type>::template rebind_alloc<node_container> node_container_allocator_type;
+    typedef std::unique_ptr<node_container> node_container_ptr;
+
     typedef typename node_container::iterator iterator;
     typedef typename node_container::const_iterator const_iterator;
 
@@ -193,16 +195,20 @@ public:
         while(node && start != last)
         {
             size_type i = (size_type) abc.to_index(*start);
-            const pair_type & p = node->next[i];
+            Node_type current = node;
             node = nullptr;
-            if(!p.first.empty())
+            if(current->next)
             {
-                key_inner_iterator pi = p.first.begin();
-                key_inner_iterator pend = p.first.end();
-                for(;pi != pend && start != last && *pi == abc.to_index(*start); ++pi, ++start);
-                if(pi == pend)
+                const pair_type & p = current->next->operator[](i);
+                if(!p.first.empty())
                 {
-                    node = p.second.get();
+                    key_inner_iterator pi = p.first.begin();
+                    key_inner_iterator pend = p.first.end();
+                    for(;pi != pend && start != last && *pi == abc.to_index(*start); ++pi, ++start);
+                    if(pi == pend)
+                    {
+                        node = p.second.get();
+                    }
                 }
             }
         }
@@ -210,26 +216,28 @@ public:
     }
 
     template <typename Iterator>
-    static type * insert_node(type * root, node_allocator_type & node_allocator, prefix_allocator_type & prefix_allocator, const charset_type & abc, Iterator start, Iterator last)
+    static type * insert_node(type * root, node_container_allocator_type & node_container_allocator, node_allocator_type & node_allocator, prefix_allocator_type & prefix_allocator, const charset_type & abc, Iterator start, Iterator last)
     {
+        pair_type empty_pair(prefix_type(), node_ptr(nullptr, node_deleter_type(node_allocator)));
         while(start != last)
         {
             size_type i = (size_type)abc.to_index(*start);
-            pair_type & p = root->next[i];
+            pair_type * p = &root->get_next(i, empty_pair);
 
-            key_inner_iterator pi = p.first.begin();
-            key_inner_iterator pend = p.first.end();
+            key_inner_iterator pi = p->first.begin();
+            key_inner_iterator pend = p->first.end();
             for(; pi != pend && start != last && *pi == abc.to_index(*start); ++pi, ++start);
             if(pi != pend)
             {
-                node_ptr jnode(p.second.release(), node_deleter_type(node_allocator));
-                prefix_type second_half(p.first, pi);
+                node_ptr jnode(p->second.release(), node_deleter_type(node_allocator));
+                prefix_type second_half(p->first, pi);
 
-                root->allocate_node(node_allocator, i, prefix_type(p.first, p.first.begin(), pi));
+                root->allocate_node(node_allocator, i, prefix_type(p->first, p->first.begin(), pi));
 
-                p.second->set_node((size_type)*pi, std::move(second_half), std::move(jnode));
+                p->second->ensure_next(node_container_allocator, node_allocator);
+                p->second->set_node((size_type)*pi, std::move(second_half), std::move(jnode));
             }
-            else if(!p.second)
+            else if(!p->second)
             {
                 prefix_type remaining(prefix_allocator, std::distance(start, last));
                 index_type * it = remaining.begin();
@@ -237,9 +245,11 @@ public:
                 {
                     *it = abc.to_index(*start);
                 }
+                root->ensure_next(node_container_allocator, node_allocator);
                 root->allocate_node(node_allocator, i, std::move(remaining) );
+                p = &root->next->operator[](i);
             }
-            root = p.second.get();
+            root = p->second.get();
         }
         return root;
     }
@@ -251,10 +261,14 @@ public:
         {
             size_type i = current->parent_link.second;
             current = current->parent_link.first;
-            pair_type & p = current->next[i];
+            pair_type & p = current->next->operator[](i);
             p.first.reset();
             p.second.reset();
             --current->nb_sub_node;
+            if(!current->nb_sub_node)
+            {
+                current->next.reset();
+            }
         }
         if(current->parent_link.first && !current->value && current->nb_sub_node == 1)
         {
@@ -262,7 +276,7 @@ public:
             for(iterator end = current->end(); it != end && !it->second; ++it);
             type * parent = current->parent_link.first;
             size_type i = current->parent_link.second;
-            parent->set_node(i, prefix_type::concat(prefix_allocator, parent->next[i].first, it->first), std::move(it->second));
+            parent->set_node(i, prefix_type::concat(prefix_allocator, parent->next->operator[](i).first, it->first), std::move(it->second));
             current = parent;
         }
     }
@@ -270,7 +284,6 @@ public:
     explicit node(parent_link_type && link, owned_value_type && value, node_allocator_type & node_allocator)
     :parent_link(std::move(link))
     ,nb_sub_node(0)
-    ,next(prefix_type(),node_ptr(nullptr, node_deleter_type(node_allocator)))
     ,value(std::move(value))
     {
     }
@@ -290,9 +303,19 @@ public:
         return parent_link;
     }
 
+    void ensure_next(node_container_allocator_type & node_container_allocator, node_allocator_type & node_allocator)
+    {
+        if(!next)
+        {
+            node_container * new_next = node_container_allocator.allocate(1);
+            new((void *)new_next) node_container(prefix_type(),node_ptr(nullptr, node_deleter_type(node_allocator)));
+            next.reset(new_next);
+        }
+    }
+
     void allocate_node(node_allocator_type & node_allocator, size_type i, prefix_type && prefix)
     {
-        pair_type & p = next[i];
+        pair_type & p = next->operator[](i);
 
         type * new_node = node_allocator.allocate(1);
         new((void *)new_node) type(parent_link_type(this, i), owned_value_type(nullptr, value.get_deleter()), node_allocator);
@@ -304,7 +327,7 @@ public:
 
     void set_node(size_type i, prefix_type && prefix, node_ptr && n)
     {
-        pair_type & p = next[i];
+        pair_type & p = next->operator[](i);
         p.first = std::move(prefix);
         p.second.reset(n.release());
         p.second->set_parent(parent_link_type(this, i));
@@ -330,39 +353,48 @@ public:
         return value;
     }
 
+    pair_type & get_next(size_type i, pair_type & empty_pair) noexcept
+    {
+        return next ? next->operator[](i) : empty_pair;
+    }
+
     iterator begin() noexcept
     {
-        return next.begin();
+        return next ? next->begin() : nullptr;
     }
 
     const_iterator begin() const noexcept
     {
-        return next.begin();
+        return next ? next->begin() : nullptr;
     }
 
     iterator end() noexcept
     {
-        return next.end();
+        return next ? next->end() : nullptr;
     }
 
     const_iterator end() const noexcept
     {
-        return next.end();
+        return next ? next->end() : nullptr;
     }
 
     void clear() noexcept
     {
         value.reset();
-        for(pair_type & n : next)
+        if(next)
         {
-            n.first.reset();
-            n.second.reset();
+            for (pair_type &n : *next.get())
+            {
+                n.first.reset();
+                n.second.reset();
+            }
+            next.reset();
         }
         nb_sub_node = 0;
     }
 private:
     parent_link_type parent_link;
-    node_container next;
+    node_container_ptr next;
     owned_value_type value;
     size_t nb_sub_node;
 };
@@ -490,6 +522,202 @@ private:
     node_ptr current;
 };
 
+template <typename Container, class Const>
+class all_node_iterator
+{
+public:
+    typedef Container container_type;
+    typedef Const constness_type;
+    typedef all_node_iterator<container_type, constness_type> type;
+    typedef typename container_type::node_type node_type;
+
+    static constexpr bool constness = std::is_same<constness_type, readonly_type>::value;
+    typedef typename std::conditional<constness, const node_type *, node_type *>::type node_ptr;
+    typedef typename std::conditional<constness, typename node_type::const_iterator, typename node_type::iterator>::type node_iterator;
+
+    all_node_iterator(node_iterator it, node_iterator end)
+    :it(it)
+    ,end(end)
+    {
+        for(; it != end && !it->second; ++it);
+    }
+
+    type & operator ++()
+    {
+        for(++it; it != end && !it->second; ++it);
+        return *this;
+    }
+
+    bool operator ==( const type & right) const
+    {
+        return it == right.it && end == right.end;
+    }
+
+    bool operator !=( const type & right) const
+    {
+        return it != right.it || end != right.end;
+    }
+
+    node_ptr operator *() const
+    {
+        return it->second.get();
+    }
+
+private:
+    node_iterator it;
+    node_iterator end;
+};
+
+
+template <typename Container, class Const>
+class all_node_iterator_generator
+{
+public:
+    typedef Container container_type;
+    typedef Const constness_type;
+    typedef all_node_iterator_generator<container_type, constness_type> type;
+    typedef typename container_type::node_type node_type;
+
+    typedef all_node_iterator<container_type, constness_type> iterator;
+    static constexpr bool constness = std::is_same<constness_type, readonly_type>::value;
+    typedef typename std::conditional<constness, const node_type *, node_type *>::type node_ptr;
+    typedef typename std::conditional<constness, typename node_type::const_iterator, typename node_type::iterator>::type node_iterator;
+
+    iterator begin(node_ptr node) const
+    {
+        return iterator(node->begin(), node->end());
+    }
+
+    iterator end(node_ptr node) const
+    {
+        return iterator(node->end(), node->end());
+    }
+
+    bool select(node_ptr node) const
+    {
+        return node->get_value();
+    }
+};
+
+template <typename Iterator>
+struct prefix_tree_matcher_iterator_state
+{
+    typedef Iterator iterator_type;
+    typedef prefix_tree_matcher_iterator_state<iterator_type> type;
+
+    prefix_tree_matcher_iterator_state(iterator_type it, iterator_type end)
+    :it(it)
+    ,end(end)
+    {
+    }
+
+    iterator_type it;
+    iterator_type end;
+};
+
+template <typename Container, typename Matcher, class Const>
+class prefix_tree_matcher_iterator
+{
+    typedef Container owner_type;
+    friend owner_type;
+public:
+    typedef typename Container::value_type value_type;
+    typedef Const constness_type;
+    typedef Matcher matcher_type;
+    typedef prefix_tree_matcher_iterator<owner_type, matcher_type, constness_type> type;
+
+    typedef prefix_tree_matcher_iterator<owner_type, matcher_type, readwrite_type> readwrite_iterator_type;
+    typedef typename std::conditional<std::is_same<constness_type, readonly_type>::value, readwrite_type, readonly_type>::type other_constness;
+    typedef prefix_tree_matcher_iterator<owner_type, matcher_type, other_constness> other_type;
+    friend other_type;
+    typedef typename owner_type::node_type node_type;
+
+    static constexpr bool constness = std::is_same<constness_type, readonly_type>::value;
+    typedef typename std::conditional<constness, const node_type *, node_type *>::type node_ptr;
+    typedef typename std::conditional<constness, typename node_type::const_iterator, typename node_type::iterator>::type node_iterator;
+    typedef typename std::conditional<constness, const value_type &, value_type &>::type reference;
+
+    typedef typename matcher_type::iterator matcher_iterator;
+    typedef prefix_tree_matcher_iterator_state<matcher_iterator> state_type;
+    typedef std::list<state_type> state_container;
+
+    explicit prefix_tree_matcher_iterator(matcher_type & matcher, node_ptr node) noexcept
+    :matcher(matcher)
+    {
+        while(node && !matcher.select(node))
+        {
+            state_type & state = states.emplace_back(state_type(matcher.begin(node), matcher.end(node)));
+            node = nullptr;
+            while(!node && !states.empty())
+            {
+                state_type & state = states.back();
+                ++state.it;
+                if(state.it != state.end)
+                {
+                    node = *state.it;
+                }
+                else
+                {
+                    states.pop_back();
+                }
+            }
+        }
+        current = node;
+    }
+
+    prefix_tree_matcher_iterator(readwrite_iterator_type && iterator) noexcept
+    :matcher(iterator.matcher)
+    ,current(std::move(iterator.current))
+    {
+    }
+
+    reference operator*() const
+    {
+        return *(current->get_value().get());
+    }
+
+    bool operator ==(const type & right) const noexcept
+    {
+        return current == right.current;
+    }
+
+    bool operator !=(const type & right) const noexcept
+    {
+        return current != right.current;
+    }
+
+    type & operator++() noexcept
+    {
+        if(current != nullptr)
+        {
+            node_ptr node = nullptr;
+            do
+            {
+                while(!node && !states.empty())
+                {
+                    state_type & state = states.back();
+                    ++state.it;
+                    if(state.it != state.end)
+                    {
+                        node = *state.it;
+                    }
+                    else
+                    {
+                        states.pop_back();
+                    }
+                }
+            }
+            while(node && !matcher.select(node));
+        }
+        return *this;
+    }
+
+private:
+    state_container states;
+    matcher_type & matcher;
+    node_ptr current;
+};
+
 template<class K, class T, class Charset, class Allocator = std::allocator<T> >
 class prefix_tree
 {
@@ -508,9 +736,11 @@ public:
 
     typedef node<key_type, mapped_type, charset_type, allocator_type> node_type;
     typedef typename node_type::parent_link_type parent_link_type;
+    typedef typename node_type::node_container node_container;
 
     typedef typename std::allocator_traits<allocator_type>::template rebind_alloc<node_type> node_allocator_type;
     typedef typename std::allocator_traits<allocator_type>::template rebind_alloc<index_type> prefix_allocator_type;
+    typedef typename std::allocator_traits<allocator_type>::template rebind_alloc<node_container> node_container_allocator_type;
     typedef typename node_type::owned_value_type mapped_type_ptr;
     typedef typename node_type::value_deleter_type deleter_type;
 
@@ -557,7 +787,7 @@ public:
 
     reference operator[] ( const key_type & k)
     {
-        mapped_type_ptr & value = node_type::insert_node(&this->root, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end())->get_value();
+        mapped_type_ptr & value = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end())->get_value();
         if(!value)
         {
             mapped_type * r = this->allocator.allocate(1);
@@ -569,7 +799,7 @@ public:
 
     std::pair<iterator, bool> insert(const key_type & k, const mapped_type & toInsert)
     {
-        node_type * node = node_type::insert_node(&this->root, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end());
+        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end());
         mapped_type_ptr & value = node->get_value();
         mapped_type * result = nullptr;
         if(!value)
@@ -583,7 +813,7 @@ public:
 
     std::pair<iterator, bool> insert(const key_type & k, mapped_type && toInsert)
     {
-        node_type * node = node_type::insert_node(&this->root, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end());
+        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end());
         mapped_type_ptr & value = node->get_value();
         mapped_type * result = nullptr;
         if(!value)
@@ -598,7 +828,7 @@ public:
     template <typename P>
     std::pair<iterator, bool> insert(const key_type & k, P && toInsert)
     {
-        node_type * node = node_type::insert_node(&this->root, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end());
+        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end());
         mapped_type_ptr & value = node->get_value();
         mapped_type * result = nullptr;
         if(!value)
@@ -613,7 +843,7 @@ public:
     template <class... Args>
     mapped_type_ptr insert_emplace(const key_type & k, Args&&... args)
     {
-        mapped_type_ptr & value = node_type::insert_node(&this->root, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end())->get_value();
+        mapped_type_ptr & value = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, k.begin(), k.end())->get_value();
         mapped_type * result = value.release();
 
         mapped_type * r = this->allocator.allocate(1);
@@ -720,11 +950,37 @@ public:
         root.clear();
     }
 
+    size_type count( const key_type & key ) const
+    {
+        const node_type * node = node_type::get(&root, abc, key.begin(), key.end());
+        return node ? 1 : 0;
+    }
+
+    iterator find( const key_type& key )
+    {
+        return iterator(node_type::get(&root, abc, key.begin(), key.end()));
+    }
+
+    const_iterator find( const key_type& key ) const
+    {
+        return const_iterator(node_type::get(&root, abc, key.begin(), key.end()));
+    }
+
+    
+
+    template <class Matcher>
+    std::pair<const_iterator,const_iterator> find_range( Matcher & matcher ) const
+    {
+        prefix_tree_matcher_iterator<readonly_type, Matcher, readonly_type> iterator(matcher, &root);
+        auto it = matcher.begin();
+    }
+
 private:
     const charset_type abc;
     allocator_type allocator;
     node_allocator_type node_allocator;
     prefix_allocator_type prefix_allocator;
+    node_container_allocator_type node_container_allocator;
     node_type root;
 };
 
