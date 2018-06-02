@@ -39,27 +39,53 @@ int main()
     toto to;
     t.insert("tito", to);
     t.insert("toto", toto(1));
-    t.insert_emplace("toto2", 2);
+    t.insert("toto2", 2);
     t["tovo"] = toto(3);
 
     for(tree::iterator it = t.begin(); it != t.end(); ++it)
     {
-        const toto & current = *it;
-        std::cout << "iterator " << current.a << std::endl;
+        const std::pair<std::string, toto> & current = *it;
+        std::cout << "iterator " << current.second.a << std::endl;
     }
     t.erase(t.begin());
     for(tree::const_iterator it = t.begin(); it != t.end(); ++it)
     {
-        const toto & current = *it;
-        std::cout << "iterator to const_iterator " << current.a << std::endl;
+        const std::pair<std::string, toto> & current = *it;
+        std::cout << "iterator to const_iterator " << current.second.a << std::endl;
     }
     t.erase("toto2");
     const tree & ct = t;
     for(tree::const_iterator it = ct.begin(); it != ct.end(); ++it)
     {
-        const toto & current = *it;
-        std::cout << "const_iterator " << current.a << std::endl;
+        const std::pair<std::string, toto> & current = *it;
+        std::cout << "const_iterator " << current.second.a << std::endl;
     }
+    std::cout << "const at " << ct.at("tovo").a << std::endl;
+    std::cout << "at " << t.at("toto").a << std::endl;
+
+    try
+    {
+        t.at("toti");
+    }
+    catch(std::exception e)
+    {
+        std::cout << "no toti " << e.what() << std::endl;
+    }
+    try
+    {
+        ct.at("voto");
+    }
+    catch(std::exception e)
+    {
+        std::cout << "no voto " << e.what() << std::endl;
+    }
+    std::cout << "[] " << t["voto"].a << std::endl;
+
+    std::cout << "count " << t.count("voto") << std::endl;
+    std::cout << "count " << t.count("v") << std::endl;
+
+    std::cout << "find " << (t.find("voto") != t.end()) << std::endl;
+    std::cout << "find " << (ct.find("vo") != t.end()) << std::endl;
 
     t.erase(t.cbegin());
     std::cout << ct.empty() << std::endl;
