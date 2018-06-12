@@ -31,7 +31,7 @@ int main()
         }
 
     };
-    typedef prefix_tree<std::string, toto, ascii_charset> tree;
+    typedef prefix_tree<std::string, toto, ascii_charset, string_prefixer_traits> tree;
     tree t = tree(ascii_charset());
 
     std::cout << "empty " << t.empty() << std::endl;
@@ -96,7 +96,7 @@ int main()
     typedef generic_charset<char, size_t, 63, 128> ctoken_charset;
     ctoken_charset cs(c.begin(), c.end());
 
-    prefix_tree<std::string, toto, ctoken_charset> tree2(cs);
+    prefix_tree<std::string, toto, ctoken_charset, string_prefixer_traits> tree2(cs);
 
     std::map<std::string, toto> m;
     m.clear();
