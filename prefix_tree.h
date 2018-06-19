@@ -125,17 +125,17 @@ template<typename Node>
 struct getter
 {
     typedef Node raw_node_type;
-    typedef typename std::remove_pointer<typename std::remove_cv<Node>::type>::type node_type;
+    typedef typename std::remove_const<raw_node_type>::type node_type;
     typedef getter<raw_node_type> type;
     typedef typename node_type::prefix_const_iterator prefix_const_iterator;
     typedef typename node_type::charset_type charset_type;
     typedef typename node_type::key_const_iterator key_const_iterator;
     typedef typename node_type::size_type size_type;
 
-    static std::pair<prefix_const_iterator, raw_node_type> get_node
+    static std::pair<prefix_const_iterator, raw_node_type *> get_node
     (
         prefix_const_iterator pi,
-        raw_node_type node,
+        raw_node_type * node,
         const charset_type & abc,
         key_const_iterator start,
         key_const_iterator last
@@ -181,7 +181,7 @@ std::pair<typename Node::prefix_const_iterator, const Node *> get_node
     typename Node::key_const_iterator last
 )
 {
-    return getter<const Node *>::get_node(pi, node, abc, start, last);
+    return getter<const Node>::get_node(pi, node, abc, start, last);
 };
 
 template<typename Node>
@@ -194,7 +194,7 @@ typename Node::key_const_iterator start,
 typename Node::key_const_iterator last
 )
 {
-    return getter<Node *>::get_node(pi, node, abc, start, last);
+    return getter<Node>::get_node(pi, node, abc, start, last);
 };
 
 
@@ -284,12 +284,76 @@ Node * insert_node
     return inserter<Node>::insert_node(root, node_container_allocator, node_allocator, prefix_allocator, abc, key, start, last);
 };
 
-
-template<typename Node>
+template<typename Node, typename Memory>
 struct remover
 {
     typedef Node node_type;
-    typedef remover<node_type> type;
+    typedef Memory memory_management_type;
+    typedef remover<node_type, memory_management_type> type;
+    typedef typename node_type::prefix_allocator_type prefix_allocator_type;
+
+    static void remove_node(node_type * current, prefix_allocator_type & prefix_allocator);
+};
+
+template<typename Node>
+struct remover<Node, own_memory>
+{
+    typedef Node node_type;
+    typedef remover<node_type, own_memory> type;
+    typedef typename node_type::prefixer_type prefixer_type;
+    typedef typename node_type::value_holder_ptr value_holder_ptr;
+    typedef typename node_type::size_type size_type;
+    typedef typename node_type::node_ptr node_ptr;
+    typedef typename node_type::content_const_iterator content_const_iterator;
+    typedef typename node_type::iterator iterator;
+    typedef typename node_type::prefix_type prefix_type;
+    typedef typename node_type::prefix_allocator_type prefix_allocator_type;
+
+    static void remove_node(node_type * current, prefix_allocator_type & prefix_allocator)
+    {
+        auto size = prefixer_type::length(current->prefix);
+
+        value_holder_ptr toDelete(std::move(current->value));
+        if(current->parent_link.first && current->empty())
+        {
+            size_type i = current->parent_link.second;
+            current = current->parent_link.first;
+            size += prefixer_type::length(current->prefix);
+            node_ptr & p = current->next->operator[](i);
+            p.reset();
+            --current->nb_sub_node;
+            if(!current->nb_sub_node)
+            {
+                current->next.reset();
+            }
+        }
+        if(toDelete && current->parent_link.first)
+        {
+            content_const_iterator content = content_const_iterator::make_begin(current);
+            const node_type * replacement = content.get_node();
+            const auto & replacement_key = content->first;
+            auto prefix_start = prefixer_type::length(toDelete->first) - size;
+            if(!current->value && current->nb_sub_node == 1)
+            {
+                iterator it = current->begin();
+                for(iterator end = current->end(); it != end && !*it; ++it);
+
+                node_type * parent = current->parent_link.first;
+                size_type i = current->parent_link.second;
+                auto concatenated_size = prefixer_type::length(current->prefix) + prefixer_type::length((*it)->prefix);
+                prefix_type concatenated = prefixer_type::make_prefix(replacement_key, prefix_start, concatenated_size);
+                parent->set_node(i, std::move(concatenated), std::move(*it));
+                current = parent;
+            }
+        }
+    }
+};
+
+template<typename Node>
+struct remover<Node, shared_memory>
+{
+    typedef Node node_type;
+    typedef remover<node_type, shared_memory> type;
     typedef typename node_type::prefixer_type prefixer_type;
     typedef typename node_type::value_holder_ptr value_holder_ptr;
     typedef typename node_type::size_type size_type;
@@ -342,7 +406,7 @@ struct remover
 template<typename Node>
 static void remove_node(Node * current, typename Node::prefix_allocator_type & prefix_allocator)
 {
-    return remover<Node>::remove_node(current, prefix_allocator);
+    return remover<Node, typename Node::prefixer_type::prefix_life_cycle_traits>::remove_node(current, prefix_allocator);
 }
 
 template<typename K, typename V, class Charset, class Prefixer, class Allocator>
@@ -385,10 +449,10 @@ public:
     typedef prefix_tree_iterator<type, readonly_type> content_const_iterator;
     typedef prefix_tree_iterator<type, readwrite_type> content_iterator;
 
-    friend getter<const type *>;
-    friend getter<type *>;
+    friend getter<const type>;
+    friend getter<type>;
     friend inserter<type>;
-    friend remover<type>;
+    friend remover<type, typename prefixer_type::prefix_life_cycle_traits>;
 
     explicit node(parent_link_type && link, value_holder_ptr && value, node_allocator_type & node_allocator)
     :parent_link(std::move(link))
