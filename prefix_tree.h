@@ -105,95 +105,6 @@ private:
     allocator_type & allocator;
 };
 
-template<typename I>
-class prefix
-{
-public:
-    typedef I index_type;
-    typedef prefix<index_type> type;
-    typedef type reference;
-    typedef index_type * index_ptr;
-    typedef std::size_t size_type;
-    typedef std::shared_ptr<index_type> buffer_ptr;
-    typedef index_ptr iterator;
-
-    template<class Allocator>
-    static type concat(Allocator & allocator, const type & first, const type & second)
-    {
-        type result(allocator, first.size() + second.size());
-        std::copy(second.begin(), second.end(), std::copy(first.begin(), first.end(), result.begin()));
-        return result;
-    }
-
-    prefix() noexcept
-	:buffer(nullptr)
-    ,start(nullptr)
-	,last(nullptr)
-	{
-	}
-
-    template<class Allocator>
-	prefix(Allocator & allocator, size_type length)
-    :buffer(allocator.allocate(length), allocator_deleter<Allocator>(length, allocator))
-    ,start(this->buffer.get())
-    ,last(this->start + length)
-    {
-    }
-	
-    prefix(const type & toSplit, iterator start) noexcept
-    :buffer(toSplit.buffer)
-	,start(start)
-    ,last(toSplit.end())
-    {
-    }
-
-    prefix(const type & toSplit, iterator start, iterator last) noexcept
-    :buffer(toSplit.buffer)
-    ,start(start)
-    ,last(last)
-    {
-    }
-
-    prefix(const type & k) noexcept
-    :buffer(k.buffer)
-    ,start(k.start)
-    ,last(k.last)
-    {
-    }
-
-    iterator begin() const noexcept
-    {
-        return start;
-    }
-
-    iterator end() const noexcept
-    {
-        return last;
-    }
-
-    size_type size() const noexcept
-    {
-        return last - start;
-    }
-
-    bool empty() const noexcept
-    {
-        return start == last;
-    }
-
-    void reset() noexcept
-    {
-        buffer.reset();
-        start = 0;
-        last = 0;
-    }
-
-private:
-    buffer_ptr buffer;
-    index_ptr start;
-    index_ptr last;
-};
-
 template<typename T, size_t...Ix, typename... Args>
 std::array<T, sizeof...(Ix)> repeat(std::index_sequence<Ix...>, Args &&... args) {
     return {{((void)Ix, T(std::forward<Args>(args)...))...}};
@@ -206,6 +117,233 @@ public:
     initialized_array(Args &&... args)
     : std::array<T, N>(repeat<T>(std::make_index_sequence<N>(), std::forward<Args>(args)...)) {}
 };
+
+struct shared_memory;
+struct own_memory;
+
+template<typename Node>
+struct getter
+{
+    typedef Node raw_node_type;
+    typedef typename std::remove_pointer<typename std::remove_cv<Node>::type>::type node_type;
+    typedef getter<raw_node_type> type;
+    typedef typename node_type::prefix_const_iterator prefix_const_iterator;
+    typedef typename node_type::charset_type charset_type;
+    typedef typename node_type::key_const_iterator key_const_iterator;
+    typedef typename node_type::size_type size_type;
+
+    static std::pair<prefix_const_iterator, raw_node_type> get_node
+    (
+        prefix_const_iterator pi,
+        raw_node_type node,
+        const charset_type & abc,
+        key_const_iterator start,
+        key_const_iterator last
+    )
+    {
+        bool matching;
+        while(node && start != last)
+        {
+            prefix_const_iterator pend = node->prefix.end();
+            for(;pi != pend && start != last && (matching = *pi == abc.to_int_type(*start)); ++pi, ++start);
+            if(pi == pend && start != last)
+            {
+                if(node->next)
+                {
+                    size_type i = (size_type) abc.to_int_type(*start);
+                    node = node->next->operator[](i).get();
+                    if(node)
+                    {
+                        pi = node->prefix.begin();
+                    }
+                }
+                else
+                {
+                    node = nullptr;
+                }
+            }
+            else if(!matching)
+            {
+                node = nullptr;
+            }
+        }
+        return std::make_pair(pi, node);
+    }
+};
+
+template<typename Node>
+std::pair<typename Node::prefix_const_iterator, const Node *> get_node
+(
+    typename Node::prefix_const_iterator pi,
+    const Node * node,
+    const typename Node::charset_type & abc,
+    typename Node::key_const_iterator start,
+    typename Node::key_const_iterator last
+)
+{
+    return getter<const Node *>::get_node(pi, node, abc, start, last);
+};
+
+template<typename Node>
+std::pair<typename Node::prefix_const_iterator, Node *> get_node
+(
+typename Node::prefix_const_iterator pi,
+Node * node,
+const typename Node::charset_type & abc,
+typename Node::key_const_iterator start,
+typename Node::key_const_iterator last
+)
+{
+    return getter<Node *>::get_node(pi, node, abc, start, last);
+};
+
+
+template<typename Node>
+struct inserter
+{
+    typedef Node node_type;
+    typedef inserter<node_type> type;
+    typedef typename node_type::node_ptr node_ptr;
+    typedef typename node_type::node_deleter_type node_deleter_type;
+    typedef typename node_type::size_type size_type;
+    typedef typename node_type::prefix_type prefix_type;
+    typedef typename node_type::prefixer_type prefixer_type;
+    typedef typename node_type::key_const_iterator key_const_iterator;
+    typedef typename node_type::prefix_const_iterator prefix_const_iterator;
+    typedef typename node_type::node_container_allocator_type node_container_allocator_type;
+    typedef typename node_type::node_allocator_type node_allocator_type;
+    typedef typename node_type::prefix_allocator_type prefix_allocator_type;
+    typedef typename node_type::charset_type charset_type;
+    typedef typename node_type::key_type key_type;
+
+    static node_type * insert_node
+    (
+        node_type * root,
+        node_container_allocator_type & node_container_allocator,
+        node_allocator_type & node_allocator,
+        prefix_allocator_type & prefix_allocator,
+        const charset_type & abc,
+        const key_type & key,
+        key_const_iterator start,
+        key_const_iterator last
+    )
+    {
+        node_ptr empty_pair(nullptr, node_deleter_type(node_allocator));
+        while(start != last)
+        {
+            size_type i = (size_type)abc.to_int_type(*start);
+            node_ptr & p = root->get_next(i, empty_pair);
+            node_type * current = p.get();
+            if(current == nullptr)
+            {
+                prefix_type remaining = prefixer_type::make_prefix(key, std::distance(key.cbegin(), start), std::distance(start, last));
+                start = last;
+
+                root->ensure_next(node_container_allocator, node_allocator);
+                root->allocate_node(node_allocator, i, std::move(remaining) );
+                current = root->next->operator[](i).get();
+            }
+            else
+            {
+                key_const_iterator from = start;
+                prefix_const_iterator pi = current->prefix.begin();
+                prefix_const_iterator pend = current->prefix.end();
+                for(; pi != pend && start != last && *pi == abc.to_int_type(*start); ++pi, ++start);
+                if(pi != pend)
+                {
+                    node_ptr jnode(p.release(), node_deleter_type(node_allocator));
+                    prefix_type first_half = prefixer_type::make_prefix(current->prefix, 0, std::distance(current->prefix.cbegin(), pi));
+                    prefix_type second_half = prefixer_type::make_prefix(current->prefix, std::distance(current->prefix.cbegin(), pi), std::distance(pi, pend));
+
+                    node_ptr & new_p = root->allocate_node(node_allocator, i, std::move(first_half));
+
+                    new_p->ensure_next(node_container_allocator, node_allocator);
+                    new_p->set_node((size_type)*pi, std::move(second_half), std::move(jnode));
+                    current = new_p.get();
+                }
+            }
+            root = current;
+        }
+        return root;
+    }
+};
+
+template<typename Node>
+Node * insert_node
+(
+    Node * root,
+    typename Node::node_container_allocator_type & node_container_allocator,
+    typename Node::node_allocator_type & node_allocator,
+    typename Node::prefix_allocator_type & prefix_allocator,
+    const typename Node::charset_type & abc,
+    const typename Node::key_type & key,
+    typename Node::key_const_iterator start,
+    typename Node::key_const_iterator last
+)
+{
+    return inserter<Node>::insert_node(root, node_container_allocator, node_allocator, prefix_allocator, abc, key, start, last);
+};
+
+
+template<typename Node>
+struct remover
+{
+    typedef Node node_type;
+    typedef remover<node_type> type;
+    typedef typename node_type::prefixer_type prefixer_type;
+    typedef typename node_type::value_holder_ptr value_holder_ptr;
+    typedef typename node_type::size_type size_type;
+    typedef typename node_type::node_ptr node_ptr;
+    typedef typename node_type::content_const_iterator content_const_iterator;
+    typedef typename node_type::iterator iterator;
+    typedef typename node_type::prefix_type prefix_type;
+    typedef typename node_type::prefix_allocator_type prefix_allocator_type;
+
+    static void remove_node(node_type * current, prefix_allocator_type & prefix_allocator)
+    {
+        auto size = prefixer_type::length(current->prefix);
+
+        value_holder_ptr toDelete(std::move(current->value));
+        if(current->parent_link.first && current->empty())
+        {
+            size_type i = current->parent_link.second;
+            current = current->parent_link.first;
+            size += prefixer_type::length(current->prefix);
+            node_ptr & p = current->next->operator[](i);
+            p.reset();
+            --current->nb_sub_node;
+            if(!current->nb_sub_node)
+            {
+                current->next.reset();
+            }
+        }
+        if(toDelete && current->parent_link.first)
+        {
+            content_const_iterator content = content_const_iterator::make_begin(current);
+            const node_type * replacement = content.get_node();
+            const auto & replacement_key = content->first;
+            auto prefix_start = prefixer_type::length(toDelete->first) - size;
+            if(!current->value && current->nb_sub_node == 1)
+            {
+                iterator it = current->begin();
+                for(iterator end = current->end(); it != end && !*it; ++it);
+
+                node_type * parent = current->parent_link.first;
+                size_type i = current->parent_link.second;
+                auto concatenated_size = prefixer_type::length(current->prefix) + prefixer_type::length((*it)->prefix);
+                prefix_type concatenated = prefixer_type::make_prefix(replacement_key, prefix_start, concatenated_size);
+                parent->set_node(i, std::move(concatenated), std::move(*it));
+                current = parent;
+            }
+        }
+    }
+};
+
+template<typename Node>
+static void remove_node(Node * current, typename Node::prefix_allocator_type & prefix_allocator)
+{
+    return remover<Node>::remove_node(current, prefix_allocator);
+}
 
 template<typename K, typename V, class Charset, class Prefixer, class Allocator>
 class node
@@ -241,125 +379,16 @@ public:
     typedef typename node_container::iterator iterator;
     typedef typename node_container::const_iterator const_iterator;
 
+    typedef typename key_type::iterator key_iterator;
+    typedef typename key_type::const_iterator key_const_iterator;
+
     typedef prefix_tree_iterator<type, readonly_type> content_const_iterator;
     typedef prefix_tree_iterator<type, readwrite_type> content_iterator;
 
-    template<class Node_type, class Iterator>
-    static std::pair<prefix_const_iterator, Node_type> get(prefix_const_iterator pi, Node_type node, const charset_type & abc, Iterator start, Iterator last)
-    {
-        bool matching;
-        while(node && start != last)
-        {
-            prefix_const_iterator pend = node->prefix.end();
-            for(;pi != pend && start != last && (matching = *pi == abc.to_int_type(*start)); ++pi, ++start);
-            if(pi == pend && start != last)
-            {
-                if(node->next)
-                {
-                    size_type i = (size_type) abc.to_int_type(*start);
-                    node = node->next->operator[](i).get();
-                    if(node)
-                    {
-                        pi = node->prefix.begin();
-                    }
-                }
-                else
-                {
-                    node = nullptr;
-                }
-            }
-            else if(!matching)
-            {
-                node = nullptr;
-            }
-        }
-        return std::make_pair(pi, node);
-    }
-
-    template <typename Key, typename Iterator>
-    static type * insert_node(type * root, node_container_allocator_type & node_container_allocator, node_allocator_type & node_allocator, prefix_allocator_type & prefix_allocator, const charset_type & abc, Key & key, Iterator start, Iterator last)
-    {
-        node_ptr empty_pair(nullptr, node_deleter_type(node_allocator));
-        while(start != last)
-        {
-            size_type i = (size_type)abc.to_int_type(*start);
-            node_ptr & p = root->get_next(i, empty_pair);
-            type * current = p.get();
-            if(current == nullptr)
-            {
-                prefix_type remaining = prefixer_type::make_prefix(key, std::distance(key.begin(), start), std::distance(start, last));
-                start = last;
-/*                auto it = remaining.begin();
-                for(;start != last;++start,++it)
-                {
-                    *it = abc.to_int_type(*start);
-                }*/
-                root->ensure_next(node_container_allocator, node_allocator);
-                root->allocate_node(node_allocator, i, std::move(remaining) );
-                current = root->next->operator[](i).get();
-            }
-            else
-            {
-                Iterator from = start;
-                prefix_const_iterator pi = current->prefix.begin();
-                prefix_const_iterator pend = current->prefix.end();
-                for(; pi != pend && start != last && *pi == abc.to_int_type(*start); ++pi, ++start);
-                if(pi != pend)
-                {
-                    node_ptr jnode(p.release(), node_deleter_type(node_allocator));
-                    prefix_type first_half = prefixer_type::make_prefix(current->prefix, 0, std::distance(current->prefix.cbegin(), pi));
-                    prefix_type second_half = prefixer_type::make_prefix(current->prefix, std::distance(current->prefix.cbegin(), pi), std::distance(pi, pend));
-
-                    node_ptr & new_p = root->allocate_node(node_allocator, i, std::move(first_half));
-
-                    new_p->ensure_next(node_container_allocator, node_allocator);
-                    new_p->set_node((size_type)*pi, std::move(second_half), std::move(jnode));
-                    current = new_p.get();
-                }
-            }
-            root = current;
-        }
-        return root;
-    }
-
-    static void remove(type * current, prefix_allocator_type & prefix_allocator)
-    {
-        auto size = prefixer_type::length(current->prefix);
-
-        value_holder_ptr toDelete(std::move(current->value));
-        if(current->parent_link.first && current->empty())
-        {
-            size_type i = current->parent_link.second;
-            current = current->parent_link.first;
-            size += prefixer_type::length(current->prefix);
-            node_ptr & p = current->next->operator[](i);
-            p.reset();
-            --current->nb_sub_node;
-            if(!current->nb_sub_node)
-            {
-                current->next.reset();
-            }
-        }
-        if(toDelete && current->parent_link.first)
-        {
-            content_const_iterator content = content_const_iterator::make_begin(current);
-            const type * replacement = content.get_node();
-            const auto & replacement_key = content->first;
-            auto prefix_start = prefixer_type::length(toDelete->first) - size;
-            if(!current->value && current->nb_sub_node == 1)
-            {
-                iterator it = current->begin();
-                for(iterator end = current->end(); it != end && !*it; ++it);
-
-                type * parent = current->parent_link.first;
-                size_type i = current->parent_link.second;
-                auto concatenated_size = prefixer_type::length(current->prefix) + prefixer_type::length((*it)->prefix);
-                prefix_type concatenated = prefixer_type::make_prefix(replacement_key, prefix_start, concatenated_size);
-                parent->set_node(i, std::move(concatenated), std::move(*it));
-                current = parent;
-            }
-        }
-    }
+    friend getter<const type *>;
+    friend getter<type *>;
+    friend inserter<type>;
+    friend remover<type>;
 
     explicit node(parent_link_type && link, value_holder_ptr && value, node_allocator_type & node_allocator)
     :parent_link(std::move(link))
@@ -490,8 +519,6 @@ private:
     size_t nb_sub_node;
 };
 
-
-
 template <typename Container, class Const>
 class all_node_iterator
 {
@@ -569,9 +596,6 @@ public:
     }
 };
 
-struct SharedMemory;
-struct OwnMemory;
-
 template<class K, class SubK, class MemoryManagement>
 class prefixer_traits
 {
@@ -593,7 +617,7 @@ class basic_string_prefixer_traits
 public:
     typedef std::basic_string<CharT, Traits, Allocator> key_type;
     typedef key_type prefix_type;
-    typedef OwnMemory prefix_life_cycle_traits;
+    typedef own_memory prefix_life_cycle_traits;
     typedef prefixer_traits<key_type, prefix_type, prefix_life_cycle_traits> type;
 
     typedef typename prefix_type::size_type size_type;
@@ -646,8 +670,8 @@ public:
     typedef typename node_type::value_holder_ptr value_holder_ptr;
     typedef typename node_type::value_holder_deleter_type value_holder_deleter_type;
 
+
     typedef mapped_type & reference;
-    typedef prefix<index_type> prefix_type;
 
     typedef prefix_tree_iterator<node_type, readonly_type> const_iterator;
     typedef prefix_tree_iterator<node_type, readwrite_type> iterator;
@@ -663,7 +687,7 @@ public:
 	
     reference at(const key_type & key) const
     {
-        const node_type * node = exact_match(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end()));
+        const node_type * node = exact_match(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end()));
         if(!node)
         {
             throw std::out_of_range("key not found");
@@ -676,7 +700,7 @@ public:
 
     reference at(const key_type & key)
     {
-        const node_type * node = exact_match(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end()));
+        const node_type * node = exact_match(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end()));
         if(!node)
         {
             throw std::out_of_range("key not found");
@@ -693,7 +717,7 @@ public:
         new((void *)a.get()) value_holder(k, mapped_type());
         value_holder_ptr value(a.release(), value_holder_deleter_type(this->allocator));
 
-        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
+        node_type * node = insert_node<node_type>(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
         value_holder_ptr & existing = node->get_value();
         if(!existing)
         {
@@ -708,7 +732,7 @@ public:
         new((void *)a.get()) value_holder(k, mapped_type());
         value_holder_ptr value(a.release(), value_holder_deleter_type(this->allocator));
 
-        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
+        node_type * node = insert_node<node_type>(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
         value_holder_ptr & existing = node->get_value();
         if(!existing)
         {
@@ -723,7 +747,7 @@ public:
         new((void *)a.get()) value_holder(k, std::forward<mapped_type>(toInsert));
         value_holder_ptr value(a.release(), value_holder_deleter_type(this->allocator));
 
-        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
+        node_type * node = insert_node<node_type>(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
         value_holder_ptr & existing = node->get_value();
         if(!existing)
         {
@@ -739,7 +763,7 @@ public:
         new((void *)a.get()) value_holder(k, std::forward<P>(toInsert));
         value_holder_ptr value(a.release(), value_holder_deleter_type(this->allocator));
 
-        node_type * node = node_type::insert_node(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
+        node_type * node = insert_node<node_type>(&this->root, this->node_container_allocator, this->node_allocator, this->prefix_allocator, abc, value->first, value->first.begin(), value->first.end());
         value_holder_ptr & existing = node->get_value();
         if(!existing)
         {
@@ -754,7 +778,7 @@ public:
 		if(to_erase)
 		{
 		    ++pos;
-		    node_type::remove(to_erase, this->prefix_allocator);
+            remove_node<node_type>(to_erase, this->prefix_allocator);
 		}
 		return pos;
 	}
@@ -765,7 +789,7 @@ public:
         if(to_erase)
         {
             ++pos;
-            node_type::remove(to_erase, this->prefix_allocator);
+            remove_node<node_type>(to_erase, this->prefix_allocator);
         }
         return pos;
 	}
@@ -791,10 +815,10 @@ public:
 	size_type erase( const key_type& key )
 	{
         size_type result = 0;
-        node_type * node = exact_match(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end()));
+        node_type * node = exact_match(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end()));
 		if(node)
 		{
-		    node_type::remove(node, this->prefix_allocator);
+            remove_node<node_type>(node, this->prefix_allocator);
 			result = size_type(1);
 		}
 		return result;
@@ -847,33 +871,33 @@ public:
 
     size_type count( const key_type & key ) const
     {
-        const node_type * node = exact_match(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end()));
+        const node_type * node = exact_match(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end()));
         return node ? 1 : 0;
     }
 
     iterator find( const key_type& key )
     {
-        return iterator::make_begin(exact_match(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end())));
+        return iterator::make_begin(exact_match(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end())));
     }
 
     const_iterator find( const key_type& key ) const
     {
-        return const_iterator::make_begin(exact_match(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end())));
+        return const_iterator::make_begin(exact_match(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end())));
     }
 
     const_iterator lower_bound( const key_type & key) const
     {
-        return const_iterator::make_begin(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end()).second);
+        return const_iterator::make_begin(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end()).second);
     }
 
     iterator lower_bound( const key_type & key)
     {
-        return iterator::make_begin(node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end()).second);
+        return iterator::make_begin(get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end()).second);
     }
 
     const_iterator upper_bound( const key_type & key) const
     {
-        std::pair<prefix_const_iterator, const node_type *> p = node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end());
+        std::pair<prefix_const_iterator, const node_type *> p = get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end());
         const_iterator result(p.second);
         if(exact_match(p))
         {
@@ -884,7 +908,7 @@ public:
 
     iterator upper_bound( const key_type & key)
     {
-        std::pair<prefix_const_iterator, const node_type *> p = node_type::get(root.prefix_begin(), &root, abc, key.begin(), key.end());
+        std::pair<prefix_const_iterator, const node_type *> p = get_node<node_type>(root.prefix_begin(), &root, abc, key.begin(), key.end());
         iterator result(p.second);
         if(exact_match(p))
         {
