@@ -5,10 +5,10 @@
 #ifndef PREFIX_TREE_ITERATOR_H
 #define PREFIX_TREE_ITERATOR_H
 
-#include<iterator>
-
-struct readonly_type;
-struct readwrite_type;
+#include <type_traits>
+#include <utility>
+#include <iterator>
+#include "util/types.h"
 
 template <typename Node, class Const>
 class prefix_tree_iterator
